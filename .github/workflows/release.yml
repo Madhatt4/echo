@@ -1,0 +1,67 @@
+name: Release
+
+# Run by hand to publish the installer for the approved version: it builds
+# Echo-Setup-<version>.exe from main and attaches it to a GitHub release
+# named for the version in package.json.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Keep the installer tools between runs
+        # electron-builder downloads Electron and the NSIS tools on every build. Keeping them means a
+        # download server having a bad minute no longer fails the build.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: installer-tools-${{ hashFiles('package-lock.json') }}
+          restore-keys: installer-tools-
+
+      - name: Build the installer
+        # One retry: the build fetches its tools from the internet, and a server error there is not ours.
+        shell: powershell
+        run: |
+          npm run dist
+          if ($LASTEXITCODE -ne 0) {
+            "Installer build failed once; trying again in 30 seconds"
+            Start-Sleep -Seconds 30
+            npm run dist
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: Publish it as a release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $installer = Get-ChildItem release -Filter 'Echo-Setup-*.exe' | Select-Object -First 1
+          if (-not $installer) { Write-Error 'no installer was built'; exit 1 }
+          $tag = "v$version"
+          # Asked this way because "gh release view" complains on the error channel when there is no such
+          # release, and Windows PowerShell treats that as a failure of the whole step.
+          $existing = @(gh release list --limit 200 --json tagName --jq '.[].tagName')
+          if ($existing -contains $tag) {
+            gh release upload $tag $installer.FullName --clobber
+          } else {
+            gh release create $tag $installer.FullName --title "Echo $version" --notes "Windows installer for Echo $version. It is not signed, so Windows will warn before running it: choose More info, then Run anyway."
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

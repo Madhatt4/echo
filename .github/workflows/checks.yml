@@ -1,0 +1,238 @@
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Build, test and open the app on Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Make a spoken recording to test speech-to-text with
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Speech
+          $wav = Join-Path $env:RUNNER_TEMP 'echo-speech.wav'
+          $voice = New-Object System.Speech.Synthesis.SpeechSynthesizer
+          $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(48000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Stereo)
+          $voice.SetOutputToWaveFile($wav, $format)
+          $voice.Rate = -1
+          $voice.Speak('My grandmother kept chickens in the garden. The quick brown fox jumps over the lazy dog.')
+          $voice.Dispose()
+          if ((Get-Item $wav).Length -lt 100000) { Write-Error 'the spoken recording was not made'; exit 1 }
+          "ECHO_SPEECH_WAV=$wav" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ECHO_MODEL_DIR=$(Join-Path $env:RUNNER_TEMP 'echo-models')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Keep the speech-to-text model between runs
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/echo-models
+          key: speech-model-whisper-base-en-q8
+
+      - name: Types are sound
+        run: npm run typecheck
+
+      - name: Tests pass
+        run: npm test
+
+      - name: The window opens and draws the home screen
+        run: npm run smoke
+
+      - name: run.ps1 works in Windows PowerShell, even on a PC set to NODE_ENV=production
+        shell: powershell
+        env:
+          NODE_ENV: production
+        run: |
+          Remove-Item -Recurse -Force node_modules, dist
+          # 2>&1 on purpose: a warning printed by a build tool must not stop the script.
+          .\run.ps1 -CheckOnly 2>&1 | ForEach-Object { "$_" }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path dist\renderer\index.html)) { Write-Error 'run.ps1 finished but built nothing'; exit 1 }
+
+      - name: run.ps1 refuses to run while Echo is open
+        shell: powershell
+        run: |
+          Start-Process -FilePath npx.cmd -ArgumentList 'electron', '.' | Out-Null
+          $deadline = (Get-Date).AddSeconds(120)
+          while (-not (Get-Process electron -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+          if (-not (Get-Process electron -ErrorAction SilentlyContinue)) { Write-Error 'Echo did not start, so the refusal could not be checked'; exit 1 }
+          .\run.ps1 -CheckOnly 2>&1 | ForEach-Object { "$_" }
+          $code = $LASTEXITCODE
+          Get-Process electron -ErrorAction SilentlyContinue | Stop-Process -Force
+          if ($code -ne 1) { Write-Error "run.ps1 should have refused while Echo was open (exit code $code)"; exit 1 }
+          exit 0
+
+  installer:
+    name: Build the Windows installer, install it, and open the installed app
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Make a spoken recording to test speech-to-text with
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Speech
+          $wav = Join-Path $env:RUNNER_TEMP 'echo-speech.wav'
+          $voice = New-Object System.Speech.Synthesis.SpeechSynthesizer
+          $format = New-Object System.Speech.AudioFormat.SpeechAudioFormatInfo(48000, [System.Speech.AudioFormat.AudioBitsPerSample]::Sixteen, [System.Speech.AudioFormat.AudioChannel]::Stereo)
+          $voice.SetOutputToWaveFile($wav, $format)
+          $voice.Rate = -1
+          $voice.Speak('My grandmother kept chickens in the garden. The quick brown fox jumps over the lazy dog.')
+          $voice.Dispose()
+          if ((Get-Item $wav).Length -lt 100000) { Write-Error 'the spoken recording was not made'; exit 1 }
+          "ECHO_SPEECH_WAV=$wav" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ECHO_MODEL_DIR=$(Join-Path $env:RUNNER_TEMP 'echo-models')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Keep the speech-to-text model between runs
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/echo-models
+          key: speech-model-whisper-base-en-q8
+
+      - name: Keep the installer tools between runs
+        # electron-builder downloads Electron and the NSIS tools on every build. Keeping them means a
+        # download server having a bad minute no longer fails the build.
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: installer-tools-${{ hashFiles('package-lock.json') }}
+          restore-keys: installer-tools-
+
+      - name: Build the installer
+        # One retry: the build fetches its tools from the internet, and a server error there is not ours.
+        shell: powershell
+        run: |
+          npm run dist
+          if ($LASTEXITCODE -ne 0) {
+            "Installer build failed once; trying again in 30 seconds"
+            Start-Sleep -Seconds 30
+            npm run dist
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: Install it as a person would, with no administrator
+        shell: powershell
+        run: |
+          $installer = Get-ChildItem release -Filter 'Echo-Setup-*.exe' | Select-Object -First 1
+          if (-not $installer) { Write-Error 'no installer was built'; exit 1 }
+          "INSTALLER: $($installer.Name), $([math]::Round($installer.Length / 1MB)) MB"
+          $run = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($run.ExitCode -ne 0) { Write-Error "the installer failed (exit code $($run.ExitCode))"; exit 1 }
+          $exe = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Programs') -Recurse -Filter 'Echo.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $exe) { Write-Error 'Echo.exe was not installed in the user''s own programs folder'; exit 1 }
+          "INSTALLED: $($exe.FullName)"
+          "ECHO_INSTALLED_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $shortcut = Get-ChildItem (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs') -Recurse -Filter 'Echo.lnk' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $shortcut) { Write-Error 'the installer made no Start menu shortcut'; exit 1 }
+          "SHORTCUT: $($shortcut.FullName)"
+
+      - name: The installed echo-door command works with Echo closed
+        shell: powershell
+        run: |
+          $door = Join-Path (Split-Path $env:ECHO_INSTALLED_EXE) 'echo-door.cmd'
+          if (-not (Test-Path $door)) { Write-Error 'echo-door.cmd was not installed beside Echo.exe'; exit 1 }
+          # Door off: status answers, and says so.
+          $env:ECHO_DOOR_FOLDER = Join-Path $env:RUNNER_TEMP 'door-off\assistant-door'
+          $text = (& $door status | Out-String)
+          "DOOR OFF: exit $LASTEXITCODE"
+          if ($LASTEXITCODE -ne 0) { Write-Error "echo-door status failed with the door off: $text"; exit 1 }
+          if (($text | ConvertFrom-Json).on -ne $false) { Write-Error "echo-door status did not say the door is off: $text"; exit 1 }
+          & $door search caravan | Out-Null
+          if ($LASTEXITCODE -ne 1) { Write-Error "a search with the door off should stop with exit code 1, not $LASTEXITCODE"; exit 1 }
+          # Door on, with a store written by Echo's own code.
+          $env:ECHO_DOOR_FOLDER = Join-Path $env:RUNNER_TEMP 'door-on\assistant-door'
+          node scripts/make-door-fixture.cjs $env:ECHO_DOOR_FOLDER
+          if ($LASTEXITCODE -ne 0) { Write-Error 'could not make a door to test with'; exit 1 }
+          $text = (& $door search caravan summer | Out-String)
+          if ($LASTEXITCODE -ne 0) { Write-Error "echo-door search failed: $text"; exit 1 }
+          $found = $text | ConvertFrom-Json
+          if ($found.found -ne 1 -or $found.passages[0].id -ne 'p1') { Write-Error "echo-door search found the wrong thing: $text"; exit 1 }
+          $read = (& $door read --from interview | Out-String) | ConvertFrom-Json
+          if ($read.total -ne 1 -or $read.passages[0].id -ne 'p2') { Write-Error 'echo-door read --from interview gave the wrong passages'; exit 1 }
+          $help = (& $door help | Out-String)
+          if ($help -notmatch 'echo-door search') { Write-Error "echo-door help did not list the commands: $help"; exit 1 }
+          "DOOR OK: the installed echo-door command searched and read a store with Echo closed"
+          # Leaving something in the tray, and seeing it there.
+          & $door suggest-words --title "Check write-up" --text "Some words the owner said." | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'echo-door suggest-words failed'; exit 1 }
+          $tray = (& $door tray | Out-String) | ConvertFrom-Json
+          if ($tray.waiting -ne 1 -or $tray.items[0].title -ne 'Check write-up') { Write-Error 'echo-door tray did not show what was left'; exit 1 }
+          "DOOR TRAY OK: the installed echo-door left a draft in the tray and listed it"
+          # Asking the echo with no AI key anywhere is refused, in words that say what to do, before anything is sent.
+          $hadKey = $env:ANTHROPIC_API_KEY
+          Remove-Item Env:ANTHROPIC_API_KEY -ErrorAction SilentlyContinue
+          $text = (& $door ask What did you do for a living | Out-String)
+          if ($LASTEXITCODE -ne 1 -or $text -notmatch 'ANTHROPIC_API_KEY') { Write-Error "echo-door ask with no key should be refused: exit $LASTEXITCODE, $text"; exit 1 }
+          if ($hadKey) { $env:ANTHROPIC_API_KEY = $hadKey }
+          "DOOR ASK OK: the installed echo-door refuses to ask the echo without a key"
+          # The same door as an MCP server, started the way an assistant starts it.
+          node scripts/check-door-mcp.cjs $env:ECHO_INSTALLED_EXE $env:ECHO_DOOR_FOLDER
+          if ($LASTEXITCODE -ne 0) { Write-Error 'the installed echo-door did not work as an MCP server'; exit 1 }
+          Remove-Item Env:ECHO_DOOR_FOLDER
+
+      - name: The installed app passes the same screen check
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'installed-out.txt'
+          $err = Join-Path $env:RUNNER_TEMP 'installed-err.txt'
+          $run = Start-Process -FilePath $env:ECHO_INSTALLED_EXE -ArgumentList '--smoke' -Wait -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+          Get-Content $out | ForEach-Object { "INSTALLED $_" }
+          Get-Content $err | Select-Object -Last 40 | ForEach-Object { "INSTALLED ERR $_" }
+          if ($run.ExitCode -ne 0) { Write-Error "the installed app failed its check (exit code $($run.ExitCode))"; exit 1 }
+          if (-not (Select-String -Path $out -Pattern 'SMOKE OK' -Quiet)) { Write-Error 'the installed app did not finish its check'; exit 1 }
+
+      - name: Keep the installer so it can be downloaded
+        uses: actions/upload-artifact@v4
+        with:
+          name: Echo-installer
+          path: release/Echo-Setup-*.exe
+          retention-days: 30
+          if-no-files-found: error
+
+  phone:
+    name: Phone app builds and speaks the same language as the PC
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: phone
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Types are sound
+        run: npm run typecheck
+
+      - name: The phone's sealing opens on the PC, and the PC's receipts check out on the phone
+        run: npm test
+
+      - name: The app bundle builds
+        run: npx vite build

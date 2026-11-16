@@ -1,0 +1,34 @@
+name: Update lockfile
+
+# Run by hand when package.json gains or loses a dependency on a branch:
+# it rewrites package-lock.json to match and commits it to that branch.
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: The branch whose package-lock.json should be brought up to date
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  lockfile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --package-lock-only --no-audit --no-fund
+      - name: Commit the lockfile if it changed
+        run: |
+          if ! git diff --quiet package-lock.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add package-lock.json
+            git commit -m "Update package-lock.json"
+            git push
+          fi

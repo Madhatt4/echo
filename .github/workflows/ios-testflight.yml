@@ -1,0 +1,182 @@
+name: Phone app to TestFlight
+
+# Builds the Echo phone app on a macOS runner, signs it, and uploads it to
+# TestFlight. Run it from the Actions tab ("Run workflow"), only when Marc
+# asks for a new build.
+#
+# Signing is Apple cloud signing, the same as the PropXchain app: the App
+# Store Connect API key lets xcodebuild create and fetch the certificate and
+# provisioning profile itself, so none is stored here. The build number is
+# the workflow run number plus 100, so every upload is unique and always goes
+# up. The 100 is because builds 1 to 5 were uploaded from an earlier copy of
+# this repository, and Apple refuses a build number it has already seen.
+#
+# Secrets (the same PropXchain Ltd App Store Connect key, set once in this repo):
+#   ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8  App Store Connect API key (Admin)
+#   APPLE_TEAM_ID                          10-character team id
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-testflight
+  cancel-in-progress: false
+
+env:
+  BUNDLE_ID: io.github.madhatt4.echo
+
+jobs:
+  testflight:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    defaults:
+      run:
+        working-directory: phone
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Work out the build number
+        run: echo "BUILD_NUMBER=$((GITHUB_RUN_NUMBER + 100))" >> "$GITHUB_ENV"
+
+      - name: Check the signing secrets are present
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          fail=0
+          for name in ASC_KEY_ID ASC_ISSUER_ID ASC_KEY_P8 APPLE_TEAM_ID; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Secret $name is missing. Add it under Settings, Secrets and variables, Actions."
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Types are sound and the phone still speaks the PC's language
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Build the app bundle and copy it into the iOS project
+        run: |
+          npx vite build
+          npx cap sync ios
+
+      - name: Write the App Store Connect key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          key_path="$RUNNER_TEMP/AuthKey_${ASC_KEY_ID}.p8"
+          printf '%s\n' "$ASC_KEY_P8" > "$key_path"
+          chmod 600 "$key_path"
+          echo "ASC_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
+      - name: Make sure Apple knows the app
+        # Registers the app ID the first time. The app record itself can only
+        # be made by a person in App Store Connect, so say so plainly if it is missing.
+        run: |
+          python3 -m pip install --quiet --break-system-packages pyjwt cryptography
+          python3 - <<'EOF'
+          import json, os, sys, time, urllib.error, urllib.request, urllib.parse, jwt
+          key = open(os.environ["ASC_KEY_PATH"]).read()
+          token = jwt.encode(
+              {"iss": os.environ["ASC_ISSUER_ID"], "iat": int(time.time()), "exp": int(time.time()) + 600, "aud": "appstoreconnect-v1"},
+              key, algorithm="ES256", headers={"kid": os.environ["ASC_KEY_ID"]})
+          bundle = os.environ["BUNDLE_ID"]
+          def call(path, body=None):
+              req = urllib.request.Request("https://api.appstoreconnect.apple.com" + path,
+                  data=json.dumps(body).encode() if body else None,
+                  headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                  method="POST" if body else "GET")
+              try:
+                  return json.load(urllib.request.urlopen(req, timeout=60))
+              except urllib.error.HTTPError as error:
+                  why = {401: "Apple refused the key. Check ASC_KEY_ID, ASC_ISSUER_ID and ASC_KEY_P8 all come from the same App Store Connect key, and that the .p8 was set from the file, not pasted.",
+                         403: "The key is not allowed to do this. It needs the Admin role."}.get(error.code, f"App Store Connect answered {error.code}.")
+                  print(f"::error::{why}")
+                  sys.exit(1)
+              except (urllib.error.URLError, TimeoutError):
+                  print("::error::Could not reach App Store Connect. Run the workflow again in a few minutes.")
+                  sys.exit(1)
+          ids = call("/v1/bundleIds?filter[identifier]=" + urllib.parse.quote(bundle))["data"]
+          if not any(b["attributes"]["identifier"] == bundle for b in ids):
+              call("/v1/bundleIds", {"data": {"type": "bundleIds", "attributes": {"identifier": bundle, "name": "Echo", "platform": "IOS"}}})
+              print("Registered the app ID", bundle)
+          else:
+              print("App ID already registered:", bundle)
+          apps = call("/v1/apps?filter[bundleId]=" + urllib.parse.quote(bundle))["data"]
+          if not apps:
+              print(f"::error::There is no app in App Store Connect for {bundle} yet. Create it (Apps, +, New App, choose {bundle}), then run this again.")
+              sys.exit(1)
+          print("App Store Connect app found")
+          EOF
+
+      - name: Archive, unsigned
+        # Signing here would make Xcode create a new development certificate on
+        # every fresh runner, and Apple caps how many a team may hold. So the
+        # archive is left unsigned and Apple's cloud signing signs it once, for
+        # distribution, in the upload step below. No certificate is created.
+        run: |
+          xcodebuild archive \
+            -project ios/App/App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+
+      - name: Sign and upload to TestFlight
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          echo "Uploaded build $BUILD_NUMBER. It shows in TestFlight once Apple finishes processing it."
+
+      - name: Remove the key
+        if: always()
+        run: rm -f "$RUNNER_TEMP"/AuthKey_*.p8
