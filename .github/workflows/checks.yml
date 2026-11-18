@@ -204,12 +204,15 @@ jobs:
           if ($run.ExitCode -ne 0) { Write-Error "the installed app failed its check (exit code $($run.ExitCode))"; exit 1 }
           if (-not (Select-String -Path $out -Pattern 'SMOKE OK' -Quiet)) { Write-Error 'the installed app did not finish its check'; exit 1 }
 
+      # Only main builds are kept, and only briefly: each installer is ~220 MB and
+      # saving one per PR update for 30 days filled the 2 GB Actions storage quota.
       - name: Keep the installer so it can be downloaded
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
           name: Echo-installer
           path: release/Echo-Setup-*.exe
-          retention-days: 30
+          retention-days: 3
           if-no-files-found: error
 
   phone:
